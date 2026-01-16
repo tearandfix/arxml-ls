@@ -12,6 +12,9 @@ from lsprotocol.types import (
     SymbolKind,
     Location,
     TextDocumentPositionParams,
+    WorkspaceEdit,
+    TextEdit,
+    PrepareRenameResult,
 )
 from lsprotocol import types
 
@@ -133,6 +136,91 @@ def extract_reference_from_line(line: str) -> str | None:
     match = re.search(pattern, line)
     if match:
         return match.group(1).strip()
+
+    return None
+
+
+def find_all_references_to_path(
+    root: etree._Element, target_path: str
+) -> list[tuple[etree._Element, int, int]]:
+    """Find all reference elements that point to a specific path.
+
+    Args:
+        root: The root XML element
+        target_path: The path to search for (e.g., '/Application/Components/MyComponent')
+
+    Returns:
+        List of tuples: (element, line_number, column)
+    """
+    matching_refs = []
+
+    for elem in root.iter():
+        tag_name = elem.tag.split("}")[-1]  # Remove namespace
+        if tag_name.endswith("REF") or tag_name.endswith("TREF"):
+            if elem.text and elem.text.strip() == target_path:
+                line = elem.sourceline if hasattr(elem, "sourceline") else 0
+                column = 0
+                matching_refs.append((elem, line, column))
+
+    return matching_refs
+
+
+def find_all_references_with_prefix(
+    root: etree._Element, path_prefix: str
+) -> list[tuple[etree._Element, str, int, int]]:
+    """Find all reference elements that start with a specific path prefix.
+
+    This is used to update references when renaming affects child paths.
+
+    Args:
+        root: The root XML element
+        path_prefix: The path prefix to search for (e.g., '/Application/Components/MyComponent')
+
+    Returns:
+        List of tuples: (element, full_ref_path, line_number, column)
+    """
+    matching_refs = []
+
+    for elem in root.iter():
+        tag_name = elem.tag.split("}")[-1]  # Remove namespace
+        if tag_name.endswith("REF") or tag_name.endswith("TREF"):
+            if elem.text:
+                ref_path = elem.text.strip()
+                if ref_path.startswith(path_prefix):
+                    line = elem.sourceline if hasattr(elem, "sourceline") else 0
+                    column = 0
+                    matching_refs.append((elem, ref_path, line, column))
+
+    return matching_refs
+
+
+def get_short_name_at_position(
+    doc_source: str, line: int
+) -> tuple[str, int, int] | None:
+    """Extract SHORT-NAME value and its position from a line.
+
+    Args:
+        doc_source: The full document source
+        line: Line number (0-indexed)
+
+    Returns:
+        Tuple of (short_name, start_col, end_col) or None if not a SHORT-NAME line
+    """
+    lines = doc_source.splitlines()
+    if line >= len(lines):
+        return None
+
+    line_text = lines[line]
+
+    # Pattern to match <SHORT-NAME>value</SHORT-NAME>
+    pattern = r"<SHORT-NAME>([^<]+)</SHORT-NAME>"
+    match = re.search(pattern, line_text)
+
+    if match:
+        short_name = match.group(1)
+        start_col = match.start(1)  # Start of the name (not the tag)
+        end_col = match.end(1)  # End of the name
+        return (short_name, start_col, end_col)
 
     return None
 
@@ -424,6 +512,160 @@ def go_to_definition(
             end=Position(target_line - 1, 100),  # Highlight whole line
         ),
     )
+
+
+@server.feature(types.TEXT_DOCUMENT_PREPARE_RENAME)
+def prepare_rename(
+    ls: LanguageServer, params: types.PrepareRenameParams
+) -> PrepareRenameResult | Range | None:
+    """Prepare rename - validates that renaming is possible at the cursor position.
+
+    This is called before the actual rename to check if the position is renameable.
+    For ARXML, we allow renaming SHORT-NAME elements.
+    """
+    doc = ls.workspace.get_text_document(params.text_document.uri)
+
+    # Check if cursor is on a SHORT-NAME line
+    short_name_info = get_short_name_at_position(doc.source, params.position.line)
+
+    if short_name_info:
+        short_name, start_col, end_col = short_name_info
+        # Return the range of the SHORT-NAME value (not the tags)
+        return Range(
+            start=Position(params.position.line, start_col),
+            end=Position(params.position.line, end_col),
+        )
+
+    return None
+
+
+@server.feature(types.TEXT_DOCUMENT_RENAME)
+def rename(ls: LanguageServer, params: types.RenameParams) -> WorkspaceEdit | None:
+    """Rename a SHORT-NAME and update all references to it.
+
+    When renaming a SHORT-NAME element, this will:
+    1. Update the SHORT-NAME itself
+    2. Find all references pointing to this element's path
+    3. Update those references with the new name
+    4. Handle child paths if they exist
+    """
+    doc = ls.workspace.get_text_document(params.text_document.uri)
+    new_name = params.new_name
+
+    # Step 1: Check if cursor is on a SHORT-NAME line
+    short_name_info = get_short_name_at_position(doc.source, params.position.line)
+    if not short_name_info:
+        return None
+
+    old_name, start_col, end_col = short_name_info
+
+    # Step 2: Parse XML and build tree to find the element's path
+    try:
+        root = etree.fromstring(doc.source.encode("utf-8"))
+        tree = build_arxml_tree(root)
+    except Exception:
+        return None
+
+    # Step 3: Find the node at this line to get its path
+    # We need to find which node's element has this sourceline
+    target_node = None
+
+    def find_node_by_line(node: ArxmlNode, line_num: int) -> ArxmlNode | None:
+        if hasattr(node.element, "sourceline"):
+            # Check if this element contains a SHORT-NAME child at the target line
+            for child in node.element:
+                child_tag = child.tag.split("}")[-1]
+                if child_tag == "SHORT-NAME" and hasattr(child, "sourceline"):
+                    if child.sourceline == line_num + 1:  # sourceline is 1-indexed
+                        return node
+
+        # Recursively search children
+        for child_node in node.children.values():
+            result = find_node_by_line(child_node, line_num)
+            if result:
+                return result
+
+        return None
+
+    target_node = find_node_by_line(tree, params.position.line)
+
+    if not target_node:
+        return None
+
+    old_path = target_node.path
+
+    # Step 4: Calculate the new path
+    path_parts = old_path.rsplit("/", 1)
+    if len(path_parts) == 2:
+        parent_path, _ = path_parts
+        new_path = f"{parent_path}/{new_name}"
+    else:
+        new_path = f"/{new_name}"
+
+    # Step 5: Find all references that need to be updated
+    changes = []
+
+    # 5a. Update the SHORT-NAME itself
+    changes.append(
+        TextEdit(
+            range=Range(
+                start=Position(params.position.line, start_col),
+                end=Position(params.position.line, end_col),
+            ),
+            new_text=new_name,
+        )
+    )
+
+    # 5b. Find and update all references to this exact path
+    exact_refs = find_all_references_to_path(root, old_path)
+    for elem, line, col in exact_refs:
+        # Find the reference text in the line
+        lines = doc.source.splitlines()
+        if line > 0 and line <= len(lines):
+            line_text = lines[line - 1]  # line is 1-indexed
+            # Find the old path in the line and replace with new path
+            pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+            match = re.search(pattern, line_text)
+            if match:
+                ref_start = match.start(1)
+                ref_end = match.end(1)
+                changes.append(
+                    TextEdit(
+                        range=Range(
+                            start=Position(line - 1, ref_start),
+                            end=Position(line - 1, ref_end),
+                        ),
+                        new_text=new_path,
+                    )
+                )
+
+    # 5c. Find and update all references that are children of this path
+    # (e.g., if renaming /A/B and there's a ref to /A/B/C, update to /A/NewName/C)
+    child_refs = find_all_references_with_prefix(root, old_path + "/")
+    for elem, ref_path, line, col in child_refs:
+        # Calculate the new reference path
+        new_ref_path = new_path + ref_path[len(old_path) :]
+
+        lines = doc.source.splitlines()
+        if line > 0 and line <= len(lines):
+            line_text = lines[line - 1]  # line is 1-indexed
+            pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+            match = re.search(pattern, line_text)
+            if match:
+                ref_start = match.start(1)
+                ref_end = match.end(1)
+                changes.append(
+                    TextEdit(
+                        range=Range(
+                            start=Position(line - 1, ref_start),
+                            end=Position(line - 1, ref_end),
+                        ),
+                        new_text=new_ref_path,
+                    )
+                )
+
+    # Step 6: Return the workspace edit with all changes
+    return WorkspaceEdit(changes={doc.uri: changes})
 
 
 if __name__ == "__main__":
