@@ -17,6 +17,7 @@ from lsprotocol import types
 
 from lxml import etree
 from dataclasses import dataclass, field
+import re
 
 
 @dataclass
@@ -110,6 +111,30 @@ def find_references(root: etree._Element) -> list[tuple[etree._Element, str, int
                 references.append((elem, ref_path, line, column))
 
     return references
+
+
+def extract_reference_from_line(line: str) -> str | None:
+    """Extract reference path from a line containing a -REF or -TREF tag.
+
+    Args:
+        line: A line of text from the XML file
+
+    Returns:
+        The reference path if found, None otherwise
+
+    Example:
+        Input: '  <APPLICATION-TYPE-TREF DEST="...">path</APPLICATION-TYPE-TREF>'
+        Output: 'path'
+    """
+    # Pattern to match tags ending in REF or TREF with their content
+    # Matches: <TAG-NAME-REF ...>content</TAG-NAME-REF>
+    pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+
+    match = re.search(pattern, line)
+    if match:
+        return match.group(1).strip()
+
+    return None
 
 
 def validate_references(root: etree._Element) -> list[tuple[str, int, int, str]]:
@@ -354,49 +379,51 @@ def document_symbols(
 def go_to_definition(
     ls: LanguageServer, params: TextDocumentPositionParams
 ) -> Location | None:
+    """Jump to the definition of a referenced element in ARXML.
+
+    When the cursor is on a line containing a -REF or -TREF tag,
+    this will jump to the element that contains the referenced SHORT-NAME.
+    """
     doc = ls.workspace.get_text_document(params.text_document.uri)
     lines = doc.source.splitlines()
 
     if params.position.line >= len(lines):
         return None
 
+    # Step 1: Check if current line contains a reference
+    line = lines[params.position.line]
+    ref_path = extract_reference_from_line(line)
+
+    if not ref_path:
+        return None
+
+    # Step 2: Parse XML and build tree
+    try:
+        root = etree.fromstring(doc.source.encode("utf-8"))
+        tree = build_arxml_tree(root)
+    except Exception:
+        return None
+
+    # Step 3: Find the referenced node
+    target_node = tree.find_by_path(ref_path)
+    if target_node is None:
+        return None
+
+    # Step 4: Return location of the target element
+    if (
+        not hasattr(target_node.element, "sourceline")
+        or target_node.element.sourceline is None
+    ):
+        return None
+
+    target_line = target_node.element.sourceline
     return Location(
         uri=doc.uri,
-        range=Range(start=Position(1, 0), end=Position(0, 0)),
+        range=Range(
+            start=Position(target_line - 1, 0),
+            end=Position(target_line - 1, 100),  # Highlight whole line
+        ),
     )
-    # # Get current word under cursor (naive)
-    # line = lines[params.position.line]
-    # word = line.strip().strip("<>").split(">")[0]  # crude, just for demo
-    #
-    # # Only handle *-REF tags
-    # if not word.endswith("-REF"):
-    #     return None
-    #
-    # # Parse XML
-    # try:
-    #     root = etree.fromstring(doc.source.encode("utf-8"))
-    # except Exception:
-    #     return None
-    #
-    # # Find the referenced target
-    # ref_value = line.split(">")[1].split("<")[0].strip()  # value inside <*-REF>
-    # if not ref_value:
-    #     return None
-    #
-    # # Search for element with UUID or ID matching ref_value
-    # for elem in root.iter():
-    #     elem_id = elem.get("UUID") or elem.get("ID")
-    #     if elem_id == ref_value:
-    #         # Return its location
-    #         return Location(
-    #             uri=doc.uri,
-    #             range=Range(
-    #                 start=Position(elem.sourceline - 1, 0),
-    #                 end=Position(elem.sourceline - 1, 100),
-    #             ),
-    #         )
-    #
-    # return None
 
 
 if __name__ == "__main__":
