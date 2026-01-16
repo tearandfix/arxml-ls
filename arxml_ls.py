@@ -96,7 +96,9 @@ def build_arxml_tree(root: etree._Element) -> ArxmlNode:
     return root_node
 
 
-def find_references(root: etree._Element) -> list[tuple[etree._Element, str, int, int]]:
+def find_all_reference_elements(
+    root: etree._Element,
+) -> list[tuple[etree._Element, str, int, int]]:
     """Find all reference elements (-REF or -TREF) and their paths.
 
     Returns:
@@ -316,7 +318,7 @@ def validate_references(root: etree._Element) -> list[tuple[str, int, int, str]]
     tree = build_arxml_tree(root)
 
     # Find all references
-    references = find_references(root)
+    references = find_all_reference_elements(root)
 
     # Validate each reference
     for elem, ref_path, line, column in references:
@@ -608,6 +610,127 @@ def go_to_definition(
             end=Position(target_line - 1, 100),  # Highlight whole line
         ),
     )
+
+
+@server.feature(types.TEXT_DOCUMENT_REFERENCES)
+def find_references(
+    ls: LanguageServer, params: types.ReferenceParams
+) -> list[Location] | None:
+    """Find all references to a SHORT-NAME element.
+
+    When the cursor is on a SHORT-NAME line, this finds all -REF and -TREF
+    tags that reference this element's path.
+
+    Args:
+        ls: Language server instance
+        params: Reference request parameters with position and context
+
+    Returns:
+        List of locations where this element is referenced, or None
+    """
+    doc = ls.workspace.get_text_document(params.text_document.uri)
+
+    # Step 1: Check if cursor is on a SHORT-NAME line
+    short_name_info = get_short_name_at_position(doc.source, params.position.line)
+
+    if not short_name_info:
+        return None
+
+    # Step 2: Parse XML and build tree to find the element's path
+    try:
+        root = etree.fromstring(doc.source.encode("utf-8"))
+        tree = build_arxml_tree(root)
+    except Exception:
+        return None
+
+    # Step 3: Find the node at this line to get its path
+    def find_node_by_line(node: ArxmlNode, line_num: int) -> ArxmlNode | None:
+        if hasattr(node.element, "sourceline"):
+            # Check if this element contains a SHORT-NAME child at the target line
+            for child in node.element:
+                child_tag = child.tag.split("}")[-1]
+                if child_tag == "SHORT-NAME" and hasattr(child, "sourceline"):
+                    if child.sourceline == line_num + 1:  # sourceline is 1-indexed
+                        return node
+
+        # Recursively search children
+        for child_node in node.children.values():
+            result = find_node_by_line(child_node, line_num)
+            if result:
+                return result
+
+        return None
+
+    target_node = find_node_by_line(tree, params.position.line)
+
+    if not target_node:
+        return None
+
+    target_path = target_node.path
+
+    # Step 4: Find all references to this path and child paths
+    locations = []
+
+    # 4a. Find exact references to this path
+    exact_refs = find_all_references_to_path(root, target_path)
+    for elem, line, col in exact_refs:
+        if line > 0:
+            # Find the exact position of the path in the line
+            lines = doc.source.splitlines()
+            if line <= len(lines):
+                line_text = lines[line - 1]
+                pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+                match = re.search(pattern, line_text)
+                if match:
+                    ref_start = match.start(1)
+                    ref_end = match.end(1)
+                    locations.append(
+                        Location(
+                            uri=doc.uri,
+                            range=Range(
+                                start=Position(line - 1, ref_start),
+                                end=Position(line - 1, ref_end),
+                            ),
+                        )
+                    )
+
+    # 4b. Find references to child paths
+    child_refs = find_all_references_with_prefix(root, target_path + "/")
+    for elem, ref_path, line, col in child_refs:
+        if line > 0:
+            lines = doc.source.splitlines()
+            if line <= len(lines):
+                line_text = lines[line - 1]
+                pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+                match = re.search(pattern, line_text)
+                if match:
+                    ref_start = match.start(1)
+                    ref_end = match.end(1)
+                    locations.append(
+                        Location(
+                            uri=doc.uri,
+                            range=Range(
+                                start=Position(line - 1, ref_start),
+                                end=Position(line - 1, ref_end),
+                            ),
+                        )
+                    )
+
+    # Step 5: Optionally include the definition itself if requested
+    if params.context.include_declaration:
+        # Add the SHORT-NAME line itself
+        short_name, start_col, end_col = short_name_info
+        locations.append(
+            Location(
+                uri=doc.uri,
+                range=Range(
+                    start=Position(params.position.line, start_col),
+                    end=Position(params.position.line, end_col),
+                ),
+            )
+        )
+
+    return locations if locations else None
 
 
 @server.feature(types.TEXT_DOCUMENT_PREPARE_RENAME)
