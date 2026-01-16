@@ -551,10 +551,14 @@ def go_to_definition(
     When the cursor is on a path segment within a -REF or -TREF tag,
     this will jump to the element corresponding to that specific segment.
 
+    If the cursor is not on a path segment (e.g., on the tag name or attributes),
+    it will fall back to jumping to the full path specified in the reference.
+
     Example:
         Path: /Application/Components/MyComponent
         Cursor on "Components" -> jumps to Components element
         Cursor on "MyComponent" -> jumps to MyComponent element
+        Cursor on "TREF" tag name -> jumps to MyComponent element (full path)
     """
     doc = ls.workspace.get_text_document(params.text_document.uri)
     lines = doc.source.splitlines()
@@ -562,14 +566,20 @@ def go_to_definition(
     if params.position.line >= len(lines):
         return None
 
-    # Step 1: Get the path segment at cursor position
     line = lines[params.position.line]
+
+    # Step 1: Try to get the path segment at cursor position (precise navigation)
     segment_info = get_path_segment_at_cursor(line, params.position.character)
 
-    if not segment_info:
-        return None
-
-    target_path, segment_idx = segment_info
+    # If cursor is on a specific segment, use that
+    if segment_info:
+        target_path, segment_idx = segment_info
+    else:
+        # Fallback: cursor not on path segment, use full path from the line
+        full_path = extract_reference_from_line(line)
+        if not full_path:
+            return None
+        target_path = full_path
 
     # Step 2: Parse XML and build tree
     try:
