@@ -116,6 +116,85 @@ def find_references(root: etree._Element) -> list[tuple[etree._Element, str, int
     return references
 
 
+def get_path_segment_at_cursor(line: str, cursor_col: int) -> tuple[str, int] | None:
+    """Extract the path segment at the cursor position and calculate the target path.
+
+    For a reference like "/Application/Components/MyComponent", if cursor is on "Components",
+    this returns ("/Application/Components", segment_index).
+
+    Args:
+        line: Line containing the reference
+        cursor_col: Column position of cursor (0-indexed)
+
+    Returns:
+        Tuple of (partial_path, segment_index) or None if not in a reference
+
+    Example:
+        Line: '<REF>/one/two/three</REF>'
+        Cursor on "two": Returns ("/one/two", 1)
+    """
+    # Find the reference pattern and extract path
+    pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
+    match = re.search(pattern, line)
+
+    if not match:
+        return None
+
+    full_path = match.group(1).strip()
+    path_start = match.start(1)
+    path_end = match.end(1)
+
+    # Check if cursor is within the path
+    if cursor_col < path_start or cursor_col >= path_end:
+        return None
+
+    # Calculate position within the path string
+    pos_in_path = cursor_col - path_start
+
+    # Special case: cursor on the leading slash - navigate to first segment
+    if pos_in_path == 0 and full_path.startswith("/"):
+        path_without_leading_slash = full_path.lstrip("/")
+        segments = path_without_leading_slash.split("/")
+        if segments:
+            return (f"/{segments[0]}", 0)
+        return None
+
+    # Split path into segments
+    # Remove leading slash if present
+    path_without_leading_slash = full_path.lstrip("/")
+    segments = path_without_leading_slash.split("/")
+
+    # Find which segment the cursor is in
+    current_pos = 1 if full_path.startswith("/") else 0  # Account for leading slash
+
+    for segment_idx, segment in enumerate(segments):
+        segment_start = current_pos
+        segment_end = current_pos + len(segment)
+
+        # Check if cursor is within this segment
+        if segment_start <= pos_in_path < segment_end:
+            # Build partial path up to and including this segment
+            partial_segments = segments[: segment_idx + 1]
+            partial_path = "/" + "/".join(partial_segments)
+            return (partial_path, segment_idx)
+
+        # Check if cursor is on the slash after this segment
+        if pos_in_path == segment_end and segment_idx < len(segments) - 1:
+            # Cursor on slash - use the segment before the slash
+            partial_segments = segments[: segment_idx + 1]
+            partial_path = "/" + "/".join(partial_segments)
+            return (partial_path, segment_idx)
+
+        # Move to next segment (add 1 for the '/')
+        current_pos = segment_end + 1
+
+    # If we're at the end, return the full path
+    if pos_in_path >= current_pos - 1:
+        return (full_path, len(segments) - 1)
+
+    return None
+
+
 def extract_reference_from_line(line: str) -> str | None:
     """Extract reference path from a line containing a -REF or -TREF tag.
 
@@ -469,8 +548,13 @@ def go_to_definition(
 ) -> Location | None:
     """Jump to the definition of a referenced element in ARXML.
 
-    When the cursor is on a line containing a -REF or -TREF tag,
-    this will jump to the element that contains the referenced SHORT-NAME.
+    When the cursor is on a path segment within a -REF or -TREF tag,
+    this will jump to the element corresponding to that specific segment.
+
+    Example:
+        Path: /Application/Components/MyComponent
+        Cursor on "Components" -> jumps to Components element
+        Cursor on "MyComponent" -> jumps to MyComponent element
     """
     doc = ls.workspace.get_text_document(params.text_document.uri)
     lines = doc.source.splitlines()
@@ -478,12 +562,14 @@ def go_to_definition(
     if params.position.line >= len(lines):
         return None
 
-    # Step 1: Check if current line contains a reference
+    # Step 1: Get the path segment at cursor position
     line = lines[params.position.line]
-    ref_path = extract_reference_from_line(line)
+    segment_info = get_path_segment_at_cursor(line, params.position.character)
 
-    if not ref_path:
+    if not segment_info:
         return None
+
+    target_path, segment_idx = segment_info
 
     # Step 2: Parse XML and build tree
     try:
@@ -492,8 +578,8 @@ def go_to_definition(
     except Exception:
         return None
 
-    # Step 3: Find the referenced node
-    target_node = tree.find_by_path(ref_path)
+    # Step 3: Find the referenced node at the target path
+    target_node = tree.find_by_path(target_path)
     if target_node is None:
         return None
 
