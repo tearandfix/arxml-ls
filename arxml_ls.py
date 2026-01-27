@@ -20,7 +20,15 @@ from lsprotocol import types
 
 from lxml import etree
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple, cast
+from pygls import uris
 import re
+
+
+REF_TAG_PATTERN = re.compile(
+    r"<[^>]*?-(?:T?REF)(?![A-Z0-9_-])[^>]*>([^<]+)</[^>]*?-(?:T?REF)(?![A-Z0-9_-])[^>]*>"
+)
 
 
 @dataclass
@@ -51,6 +59,226 @@ class ArxmlNode:
                 return None
 
         return current
+
+
+@dataclass
+class ProjectDocument:
+    uri: str
+    path: Path
+    source: str
+    root: etree._Element | None = None
+    tree: ArxmlNode | None = None
+    parse_error: Exception | None = None
+    _lines: List[str] | None = field(default=None, init=False, repr=False)
+
+    @property
+    def lines(self) -> List[str]:
+        if self._lines is None:
+            self._lines = self.source.splitlines()
+        return self._lines
+
+
+@dataclass
+class ProjectIndex:
+    documents: Dict[str, ProjectDocument]
+    nodes_by_path: Dict[str, List[Tuple[str, ArxmlNode]]]
+    references_by_doc: Dict[str, List[Tuple[etree._Element, str, int, int]]]
+
+    def find_node(self, path: str) -> Tuple[str, ArxmlNode] | None:
+        matches = self.nodes_by_path.get(path)
+        if matches:
+            return matches[0]
+        return None
+
+    def path_exists(self, path: str) -> bool:
+        return path in self.nodes_by_path
+
+
+def find_node_by_short_name_line(node: ArxmlNode, line_num: int) -> ArxmlNode | None:
+    if hasattr(node.element, "sourceline"):
+        for child in node.element:
+            child_tag = child.tag.split("}")[-1]
+            if child_tag == "SHORT-NAME" and hasattr(child, "sourceline"):
+                if child.sourceline == line_num + 1:
+                    return node
+
+    for child_node in node.children.values():
+        result = find_node_by_short_name_line(child_node, line_num)
+        if result:
+            return result
+
+    return None
+
+
+def find_reference_span_in_line(
+    line_text: str, ref_path: str
+) -> Tuple[int, int] | None:
+    for match in REF_TAG_PATTERN.finditer(line_text):
+        if match.group(1).strip() == ref_path:
+            return match.start(1), match.end(1)
+    return None
+
+
+def locate_reference_span(line_text: str, ref_path: str) -> Tuple[int, int] | None:
+    span = find_reference_span_in_line(line_text, ref_path)
+    if span:
+        return span
+    idx = line_text.find(ref_path)
+    if idx != -1:
+        return idx, idx + len(ref_path)
+    return None
+
+
+def is_reference_tag(tag_name: str) -> bool:
+    return tag_name.endswith("-REF") or tag_name.endswith("-TREF")
+
+
+def extract_reference_path(elem: etree._Element) -> str | None:
+    tag_name = elem.tag.split("}")[-1]
+    if not is_reference_tag(tag_name):
+        return None
+    if len(elem):
+        # Nested elements are not allowed inside references
+        return None
+    if elem.text:
+        ref_path = elem.text.strip()
+        if ref_path:
+            return ref_path
+    return None
+
+
+def _get_workspace_root(ls: LanguageServer, fallback_uri: str) -> Path:
+    root_path_value = ls.workspace.root_path or ""
+    if root_path_value:
+        return Path(root_path_value)
+    if fallback_uri:
+        try:
+            return Path(str(uris.to_fs_path(fallback_uri))).parent
+        except Exception:
+            pass
+    return Path.cwd()
+
+
+def _discover_arxml_files(ls: LanguageServer, fallback_uri: str) -> Dict[str, Path]:
+    files: Dict[str, Path] = {}
+    workspace_docs = getattr(ls.workspace, "documents", {})
+
+    for doc in workspace_docs.values():
+        doc_uri_obj = getattr(doc, "uri", None)
+        if doc_uri_obj is None or not isinstance(doc_uri_obj, str):
+            continue
+        if not doc_uri_obj:
+            continue
+        try:
+            doc_path = Path(str(uris.to_fs_path(doc_uri_obj))).resolve()
+            files[doc_uri_obj] = doc_path
+        except Exception:
+            continue
+
+    root_path = _get_workspace_root(ls, fallback_uri)
+    if root_path.exists():
+        for path in root_path.glob("*.arxml"):
+            resolved = path.resolve()
+            uri_value = uris.from_fs_path(str(resolved))
+            if not uri_value:
+                continue
+            files.setdefault(uri_value, resolved)
+
+    # Ensure fallback document is included even if not already tracked
+    if fallback_uri:
+        try:
+            fallback_path = Path(str(uris.to_fs_path(fallback_uri))).resolve()
+            files.setdefault(fallback_uri, fallback_path)
+        except Exception:
+            pass
+
+    return files
+
+
+def _compute_workspace_state(
+    ls: LanguageServer, files: Dict[str, Path]
+) -> Tuple[Tuple[str, float | int | None], ...]:
+    workspace_docs = getattr(ls.workspace, "documents", {})
+    state: List[Tuple[str, float | int | None]] = []
+
+    for uri, path in files.items():
+        doc = workspace_docs.get(uri)
+        if doc is not None:
+            state.append((uri, doc.version))
+        else:
+            try:
+                state.append((uri, path.stat().st_mtime_ns))
+            except OSError:
+                state.append((uri, None))
+
+    return tuple(sorted(state, key=lambda item: item[0]))
+
+
+def _register_nodes_for_document(
+    doc_uri: str, node: ArxmlNode, registry: Dict[str, List[Tuple[str, ArxmlNode]]]
+) -> None:
+    for child in node.children.values():
+        if child.path:
+            registry.setdefault(child.path, []).append((doc_uri, child))
+        _register_nodes_for_document(doc_uri, child, registry)
+
+
+def _build_project_index(ls: LanguageServer, files: Dict[str, Path]) -> ProjectIndex:
+    documents: Dict[str, ProjectDocument] = {}
+    nodes_by_path: Dict[str, List[Tuple[str, ArxmlNode]]] = {}
+    references_by_doc: Dict[str, List[Tuple[etree._Element, str, int, int]]] = {}
+
+    workspace_docs = getattr(ls.workspace, "documents", {})
+
+    for uri, path in files.items():
+        source: str | None = None
+        doc = workspace_docs.get(uri)
+        if doc is not None:
+            source = doc.source
+        else:
+            try:
+                source = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+        if source is None:
+            continue
+
+        project_doc = ProjectDocument(uri=uri, path=path, source=source)
+
+        try:
+            root = etree.fromstring(source.encode("utf-8"))
+            tree = build_arxml_tree(root)
+            project_doc.root = root
+            project_doc.tree = tree
+            references_by_doc[uri] = find_all_reference_elements(root)
+            _register_nodes_for_document(uri, tree, nodes_by_path)
+        except Exception as exc:
+            project_doc.parse_error = exc
+            references_by_doc[uri] = []
+
+        documents[uri] = project_doc
+
+    return ProjectIndex(
+        documents=documents,
+        nodes_by_path=nodes_by_path,
+        references_by_doc=references_by_doc,
+    )
+
+
+def _get_project_index(ls: LanguageServer, current_uri: str) -> ProjectIndex:
+    files = _discover_arxml_files(ls, current_uri)
+    state = _compute_workspace_state(ls, files)
+    cache = getattr(ls, "_project_index_cache", None)
+
+    if cache and cache.get("state") == state:
+        cached_index = cache.get("index")
+        if cached_index:
+            return cached_index
+
+    index = _build_project_index(ls, files)
+    setattr(ls, "_project_index_cache", {"state": state, "index": index})
+    return index
 
 
 class ArxmlLanguageServer(LanguageServer):
@@ -107,13 +335,11 @@ def find_all_reference_elements(
     references = []
 
     for elem in root.iter():
-        tag_name = elem.tag.split("}")[-1]  # Remove namespace
-        if tag_name.endswith("REF") or tag_name.endswith("TREF"):
-            if elem.text:
-                ref_path = elem.text.strip()
-                line = elem.sourceline if hasattr(elem, "sourceline") else 0
-                column = 0  # lxml doesn't provide column info easily
-                references.append((elem, ref_path, line, column))
+        ref_path = extract_reference_path(elem)
+        if ref_path:
+            line = elem.sourceline if hasattr(elem, "sourceline") else 0
+            column = 0  # lxml doesn't provide column info easily
+            references.append((elem, ref_path, line, column))
 
     return references
 
@@ -136,8 +362,7 @@ def get_path_segment_at_cursor(line: str, cursor_col: int) -> tuple[str, int] | 
         Cursor on "two": Returns ("/one/two", 1)
     """
     # Find the reference pattern and extract path
-    pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-    match = re.search(pattern, line)
+    match = REF_TAG_PATTERN.search(line)
 
     if not match:
         return None
@@ -212,9 +437,7 @@ def extract_reference_from_line(line: str) -> str | None:
     """
     # Pattern to match tags ending in REF or TREF with their content
     # Matches: <TAG-NAME-REF ...>content</TAG-NAME-REF>
-    pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-
-    match = re.search(pattern, line)
+    match = REF_TAG_PATTERN.search(line)
     if match:
         return match.group(1).strip()
 
@@ -236,12 +459,11 @@ def find_all_references_to_path(
     matching_refs = []
 
     for elem in root.iter():
-        tag_name = elem.tag.split("}")[-1]  # Remove namespace
-        if tag_name.endswith("REF") or tag_name.endswith("TREF"):
-            if elem.text and elem.text.strip() == target_path:
-                line = elem.sourceline if hasattr(elem, "sourceline") else 0
-                column = 0
-                matching_refs.append((elem, line, column))
+        ref_path = extract_reference_path(elem)
+        if ref_path == target_path:
+            line = elem.sourceline if hasattr(elem, "sourceline") else 0
+            column = 0
+            matching_refs.append((elem, line, column))
 
     return matching_refs
 
@@ -263,14 +485,11 @@ def find_all_references_with_prefix(
     matching_refs = []
 
     for elem in root.iter():
-        tag_name = elem.tag.split("}")[-1]  # Remove namespace
-        if tag_name.endswith("REF") or tag_name.endswith("TREF"):
-            if elem.text:
-                ref_path = elem.text.strip()
-                if ref_path.startswith(path_prefix):
-                    line = elem.sourceline if hasattr(elem, "sourceline") else 0
-                    column = 0
-                    matching_refs.append((elem, ref_path, line, column))
+        ref_path = extract_reference_path(elem)
+        if ref_path and ref_path.startswith(path_prefix):
+            line = elem.sourceline if hasattr(elem, "sourceline") else 0
+            column = 0
+            matching_refs.append((elem, ref_path, line, column))
 
     return matching_refs
 
@@ -435,9 +654,10 @@ def validate_arxml(
         schema_path = "/home/yura/autosar_20_11_schema/AUTOSAR_00049_COMPACT.xsd"
         schema_error = validate_arxml_schema(doc.source, schema_path)
         if schema_error and hasattr(schema_error, "error_log"):
-            error_log = schema_error.error_log  # type: ignore
+            error_log = getattr(schema_error, "error_log", None)
             try:
-                for entry in error_log:
+                iterable_log = cast(Iterable[Any], error_log) if error_log else []
+                for entry in iterable_log:
                     diagnostics.append(
                         Diagnostic(
                             range=Range(
@@ -466,26 +686,40 @@ def validate_arxml(
                 )
             )
 
-    # Third: Reference validation
-    try:
-        root = etree.fromstring(doc.source.encode("utf-8"))
-        ref_errors = validate_references(root)
+    # Third: Reference validation across workspace
+    project_index = _get_project_index(ls, doc.uri)
+    references = project_index.references_by_doc.get(doc.uri, [])
+    project_doc = project_index.documents.get(doc.uri)
+    doc_lines = project_doc.lines if project_doc else doc.source.splitlines()
 
-        for tag_name, line, column, error_msg in ref_errors:
-            diagnostics.append(
-                Diagnostic(
-                    range=Range(
-                        start=Position(line - 1, column),
-                        end=Position(line - 1, column + 100),  # approximate end
-                    ),
-                    message=error_msg,
-                    severity=DiagnosticSeverity.Error,
-                    source="arxml-ls",
-                )
+    for elem, ref_path, line, column in references:
+        if project_index.path_exists(ref_path):
+            continue
+
+        tag_name = elem.tag.split("}")[-1]
+        start_line = max(line - 1, 0) if line else 0
+        start_col = 0
+        end_col = 1
+
+        if line > 0 and line <= len(doc_lines):
+            line_text = doc_lines[line - 1]
+            span = locate_reference_span(line_text, ref_path)
+            if span:
+                start_col, end_col = span
+            else:
+                end_col = len(line_text)
+
+        diagnostics.append(
+            Diagnostic(
+                range=Range(
+                    start=Position(start_line, start_col),
+                    end=Position(start_line, end_col),
+                ),
+                message=f"Invalid reference in {tag_name}: '{ref_path}' does not exist",
+                severity=DiagnosticSeverity.Error,
+                source="arxml-ls",
             )
-    except Exception:
-        # ignore parsing errors here; they are already reported above
-        pass
+        )
 
     ls.publish_diagnostics(doc.uri, diagnostics)
 
@@ -584,16 +818,11 @@ def go_to_definition(
         target_path = full_path
 
     # Step 2: Parse XML and build tree
-    try:
-        root = etree.fromstring(doc.source.encode("utf-8"))
-        tree = build_arxml_tree(root)
-    except Exception:
+    project_index = _get_project_index(ls, doc.uri)
+    target_entry = project_index.find_node(target_path)
+    if not target_entry:
         return None
-
-    # Step 3: Find the referenced node at the target path
-    target_node = tree.find_by_path(target_path)
-    if target_node is None:
-        return None
+    target_uri, target_node = target_entry
 
     # Step 4: Return location of the target element
     if (
@@ -604,7 +833,7 @@ def go_to_definition(
 
     target_line = target_node.element.sourceline
     return Location(
-        uri=doc.uri,
+        uri=target_uri,
         range=Range(
             start=Position(target_line - 1, 0),
             end=Position(target_line - 1, 100),  # Highlight whole line
@@ -636,32 +865,12 @@ def find_references(
     if not short_name_info:
         return None
 
-    # Step 2: Parse XML and build tree to find the element's path
-    try:
-        root = etree.fromstring(doc.source.encode("utf-8"))
-        tree = build_arxml_tree(root)
-    except Exception:
+    project_index = _get_project_index(ls, doc.uri)
+    project_doc = project_index.documents.get(doc.uri)
+    if not project_doc or not project_doc.tree:
         return None
 
-    # Step 3: Find the node at this line to get its path
-    def find_node_by_line(node: ArxmlNode, line_num: int) -> ArxmlNode | None:
-        if hasattr(node.element, "sourceline"):
-            # Check if this element contains a SHORT-NAME child at the target line
-            for child in node.element:
-                child_tag = child.tag.split("}")[-1]
-                if child_tag == "SHORT-NAME" and hasattr(child, "sourceline"):
-                    if child.sourceline == line_num + 1:  # sourceline is 1-indexed
-                        return node
-
-        # Recursively search children
-        for child_node in node.children.values():
-            result = find_node_by_line(child_node, line_num)
-            if result:
-                return result
-
-        return None
-
-    target_node = find_node_by_line(tree, params.position.line)
+    target_node = find_node_by_short_name_line(project_doc.tree, params.position.line)
 
     if not target_node:
         return None
@@ -671,50 +880,32 @@ def find_references(
     # Step 4: Find all references to this path and child paths
     locations = []
 
-    # 4a. Find exact references to this path
-    exact_refs = find_all_references_to_path(root, target_path)
-    for elem, line, col in exact_refs:
-        if line > 0:
-            # Find the exact position of the path in the line
-            lines = doc.source.splitlines()
-            if line <= len(lines):
-                line_text = lines[line - 1]
-                pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-                match = re.search(pattern, line_text)
-                if match:
-                    ref_start = match.start(1)
-                    ref_end = match.end(1)
-                    locations.append(
-                        Location(
-                            uri=doc.uri,
-                            range=Range(
-                                start=Position(line - 1, ref_start),
-                                end=Position(line - 1, ref_end),
-                            ),
-                        )
-                    )
-
-    # 4b. Find references to child paths
-    child_refs = find_all_references_with_prefix(root, target_path + "/")
-    for elem, ref_path, line, col in child_refs:
-        if line > 0:
-            lines = doc.source.splitlines()
-            if line <= len(lines):
-                line_text = lines[line - 1]
-                pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-                match = re.search(pattern, line_text)
-                if match:
-                    ref_start = match.start(1)
-                    ref_end = match.end(1)
-                    locations.append(
-                        Location(
-                            uri=doc.uri,
-                            range=Range(
-                                start=Position(line - 1, ref_start),
-                                end=Position(line - 1, ref_end),
-                            ),
-                        )
-                    )
+    for ref_doc_uri, ref_entries in project_index.references_by_doc.items():
+        ref_doc = project_index.documents.get(ref_doc_uri)
+        if not ref_doc:
+            continue
+        lines = ref_doc.lines
+        for elem, ref_path, line, col in ref_entries:
+            is_exact = ref_path == target_path
+            is_child = ref_path.startswith(f"{target_path}/")
+            if not (is_exact or is_child):
+                continue
+            if line <= 0 or line > len(lines):
+                continue
+            line_text = lines[line - 1]
+            span = locate_reference_span(line_text, ref_path)
+            if not span:
+                span = (0, len(line_text))
+            ref_start, ref_end = span
+            locations.append(
+                Location(
+                    uri=ref_doc_uri,
+                    range=Range(
+                        start=Position(line - 1, ref_start),
+                        end=Position(line - 1, ref_end),
+                    ),
+                )
+            )
 
     # Step 5: Optionally include the definition itself if requested
     if params.context.include_declaration:
@@ -778,35 +969,12 @@ def rename(ls: LanguageServer, params: types.RenameParams) -> WorkspaceEdit | No
 
     old_name, start_col, end_col = short_name_info
 
-    # Step 2: Parse XML and build tree to find the element's path
-    try:
-        root = etree.fromstring(doc.source.encode("utf-8"))
-        tree = build_arxml_tree(root)
-    except Exception:
+    project_index = _get_project_index(ls, doc.uri)
+    project_doc = project_index.documents.get(doc.uri)
+    if not project_doc or not project_doc.tree:
         return None
 
-    # Step 3: Find the node at this line to get its path
-    # We need to find which node's element has this sourceline
-    target_node = None
-
-    def find_node_by_line(node: ArxmlNode, line_num: int) -> ArxmlNode | None:
-        if hasattr(node.element, "sourceline"):
-            # Check if this element contains a SHORT-NAME child at the target line
-            for child in node.element:
-                child_tag = child.tag.split("}")[-1]
-                if child_tag == "SHORT-NAME" and hasattr(child, "sourceline"):
-                    if child.sourceline == line_num + 1:  # sourceline is 1-indexed
-                        return node
-
-        # Recursively search children
-        for child_node in node.children.values():
-            result = find_node_by_line(child_node, line_num)
-            if result:
-                return result
-
-        return None
-
-    target_node = find_node_by_line(tree, params.position.line)
+    target_node = find_node_by_short_name_line(project_doc.tree, params.position.line)
 
     if not target_node:
         return None
@@ -822,69 +990,61 @@ def rename(ls: LanguageServer, params: types.RenameParams) -> WorkspaceEdit | No
         new_path = f"/{new_name}"
 
     # Step 5: Find all references that need to be updated
-    changes = []
+    changes: Dict[str, List[TextEdit]] = {}
+
+    def add_edit(uri: str, edit: TextEdit) -> None:
+        changes.setdefault(uri, []).append(edit)
 
     # 5a. Update the SHORT-NAME itself
-    changes.append(
+    add_edit(
+        doc.uri,
         TextEdit(
             range=Range(
                 start=Position(params.position.line, start_col),
                 end=Position(params.position.line, end_col),
             ),
             new_text=new_name,
-        )
+        ),
     )
 
-    # 5b. Find and update all references to this exact path
-    exact_refs = find_all_references_to_path(root, old_path)
-    for elem, line, col in exact_refs:
-        # Find the reference text in the line
-        lines = doc.source.splitlines()
-        if line > 0 and line <= len(lines):
-            line_text = lines[line - 1]  # line is 1-indexed
-            # Find the old path in the line and replace with new path
-            pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-            match = re.search(pattern, line_text)
-            if match:
-                ref_start = match.start(1)
-                ref_end = match.end(1)
-                changes.append(
-                    TextEdit(
-                        range=Range(
-                            start=Position(line - 1, ref_start),
-                            end=Position(line - 1, ref_end),
-                        ),
-                        new_text=new_path,
-                    )
-                )
+    # 5b. Update references across all documents
+    for ref_doc_uri, ref_entries in project_index.references_by_doc.items():
+        ref_doc = project_index.documents.get(ref_doc_uri)
+        if not ref_doc:
+            continue
+        lines = ref_doc.lines
+        for elem, ref_path, line, col in ref_entries:
+            replacement: str | None = None
+            if ref_path == old_path:
+                replacement = new_path
+            elif ref_path.startswith(f"{old_path}/"):
+                replacement = new_path + ref_path[len(old_path) :]
 
-    # 5c. Find and update all references that are children of this path
-    # (e.g., if renaming /A/B and there's a ref to /A/B/C, update to /A/NewName/C)
-    child_refs = find_all_references_with_prefix(root, old_path + "/")
-    for elem, ref_path, line, col in child_refs:
-        # Calculate the new reference path
-        new_ref_path = new_path + ref_path[len(old_path) :]
+            if replacement is None:
+                continue
 
-        lines = doc.source.splitlines()
-        if line > 0 and line <= len(lines):
-            line_text = lines[line - 1]  # line is 1-indexed
-            pattern = r"<[^>]*?(?:T?REF)[^>]*>([^<]+)</[^>]*?(?:T?REF)>"
-            match = re.search(pattern, line_text)
-            if match:
-                ref_start = match.start(1)
-                ref_end = match.end(1)
-                changes.append(
-                    TextEdit(
-                        range=Range(
-                            start=Position(line - 1, ref_start),
-                            end=Position(line - 1, ref_end),
-                        ),
-                        new_text=new_ref_path,
-                    )
-                )
+            if line <= 0 or line > len(lines):
+                continue
+
+            line_text = lines[line - 1]
+            span = locate_reference_span(line_text, ref_path)
+            if not span:
+                span = (0, len(line_text))
+            ref_start, ref_end = span
+
+            add_edit(
+                ref_doc_uri,
+                TextEdit(
+                    range=Range(
+                        start=Position(line - 1, ref_start),
+                        end=Position(line - 1, ref_end),
+                    ),
+                    new_text=replacement,
+                ),
+            )
 
     # Step 6: Return the workspace edit with all changes
-    return WorkspaceEdit(changes={doc.uri: changes})
+    return WorkspaceEdit(changes=changes)
 
 
 if __name__ == "__main__":
