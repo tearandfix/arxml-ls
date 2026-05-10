@@ -75,11 +75,14 @@ arxml_ls.py        # Entry point
 ## Development
 
 ```bash
+# Run tests
+pytest
+
 # Lint
-ruff check arxml_ls/ arxml_ls.py
+ruff check arxml_ls/ arxml_ls.py tests/
 
 # Format
-ruff format arxml_ls/ arxml_ls.py
+ruff format arxml_ls/ arxml_ls.py tests/
 ```
 
-There are no automated tests. Manual testing is done by opening `.arxml` files in an editor with the server configured as an LSP provider.
+Manual end-to-end testing is done by opening `.arxml` files in an editor with the server configured as an LSP provider.

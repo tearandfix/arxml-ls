@@ -17,7 +17,9 @@ def parse_arxml(text: str) -> etree.XMLSyntaxError | None:
         return e
 
 
-def validate_arxml_schema(xml_text: str, schema_path: str) -> (
+def validate_arxml_schema(
+    xml_text: str, schema_path: str
+) -> (
     etree.DocumentInvalid
     | etree.XMLSchemaParseError
     | etree.XMLSyntaxError
