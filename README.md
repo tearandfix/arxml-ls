@@ -30,19 +30,18 @@ The server communicates over stdio, which is the standard mode for LSP clients.
 python arxml_ls.py
 ```
 
-### Neovim (via `nvim-lspconfig`)
+### Neovim (via `arxml.nvim`)
+The most convenient way is to use the companion Neovim plugin, which auto-starts the server
+for every `.arxml` buffer. No extra configuration is needed. 
+Please refere to [arxml.nvim](https://github.com/tearandfix/arxml.nvim) for installation instructions.
 
+Configuration for lazy.nvim:
 ```lua
-vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, {
-  pattern = "*.arxml",
-  callback = function()
-    vim.lsp.start({
-      name = "arxml-ls",
-      cmd = { "python", "/path/to/arxml_ls.py" },
-      root_dir = vim.fs.dirname(vim.fs.find(".git", { upward = true })[1]),
-    })
-  end,
-})
+{
+  "tearandfix/arxml.nvim",
+  dependencies = { "tearandfix/arxml_ls" },
+  ft = "arxml"
+}
 ```
 
 ### VS Code
