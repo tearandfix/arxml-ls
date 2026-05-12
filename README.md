@@ -10,6 +10,7 @@ A Language Server Protocol (LSP) server for AUTOSAR ARXML files, providing edito
 - **Go to definition** — cursor on any segment of a `/Path/To/Element` reference jumps to that segment's element, not just the leaf
 - **Find references** — cursor on a `<SHORT-NAME>` finds every `-REF`/`-TREF` pointing to that element or any of its children
 - **Rename** — renames a `<SHORT-NAME>` and updates all references across the workspace
+- **AUTOSAR R20-11** - schema validation for AUTOSAR R20-11 (0049)
 
 ## Requirements
 
@@ -50,14 +51,13 @@ Add a custom LSP entry via the [custom LSP extension](https://marketplace.visual
 
 ### Schema validation
 
-XSD schema validation uses the AUTOSAR schema file. Set the path via environment variable:
+XSD schema validation uses the AUTOSAR schema file. AUTOSAR_00049_COMPACT.xsd is automatically downloaded if not available. 
+Custom schema file can be set via environment variable:
 
 ```bash
 export ARXML_SCHEMA_PATH=/path/to/AUTOSAR_00049_COMPACT.xsd
 python arxml_ls.py
 ```
-
-If the file is absent, schema validation is silently skipped and only XML syntax and cross-reference checks run.
 
 ## Project layout
 
