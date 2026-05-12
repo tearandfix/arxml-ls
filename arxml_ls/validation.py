@@ -2,11 +2,20 @@ import os
 
 from lxml import etree
 
+from .schema import get_schema_path
 
-SCHEMA_PATH = os.environ.get(
-    "ARXML_SCHEMA_PATH",
-    "/home/yura/autosar_20_11_schema/AUTOSAR_00049_COMPACT.xsd",
-)
+
+def _resolve_schema_path() -> str:
+    env = os.environ.get("ARXML_SCHEMA_PATH")
+    if env:
+        return env
+    try:
+        return str(get_schema_path())
+    except Exception:
+        return ""
+
+
+SCHEMA_PATH = _resolve_schema_path()
 
 
 def parse_arxml(text: str) -> etree.XMLSyntaxError | None:
