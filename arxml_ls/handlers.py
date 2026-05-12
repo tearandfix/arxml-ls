@@ -1,5 +1,14 @@
 import logging
 import logging.handlers
+
+_LOG_FILE = "/tmp/arxml-ls.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.handlers.RotatingFileHandler(_LOG_FILE, maxBytes=500_000_000, backupCount=2)],
+)
+logger = logging.getLogger("arxml-ls")
+
 from typing import Any, Dict, Iterable, List, cast
 
 from lsprotocol import types
@@ -31,14 +40,6 @@ from .analysis import (
 )
 from .indexing import _get_project_index
 from .validation import SCHEMA_PATH, parse_arxml, validate_arxml_schema
-
-_LOG_FILE = "/tmp/arxml-ls.log"
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[logging.handlers.RotatingFileHandler(_LOG_FILE, maxBytes=500_000_000, backupCount=2)],
-)
-logger = logging.getLogger("arxml-ls")
 
 
 class ArxmlLanguageServer(LanguageServer):
