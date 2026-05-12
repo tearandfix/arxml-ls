@@ -1,3 +1,5 @@
+import logging
+import logging.handlers
 from typing import Any, Dict, Iterable, List, cast
 
 from lsprotocol import types
@@ -30,12 +32,21 @@ from .analysis import (
 from .indexing import _get_project_index
 from .validation import SCHEMA_PATH, parse_arxml, validate_arxml_schema
 
+_LOG_FILE = "/tmp/arxml-ls.log"
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[logging.handlers.RotatingFileHandler(_LOG_FILE, maxBytes=500_000_000, backupCount=2)],
+)
+logger = logging.getLogger("arxml-ls")
+
 
 class ArxmlLanguageServer(LanguageServer):
     CMD_NAME = "arxml-ls"
 
 
 server = ArxmlLanguageServer("arxml-ls", "0.1.0")
+logger.info("arxml-ls server initialised")
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_OPEN)
@@ -45,11 +56,13 @@ def validate_arxml(
     params: types.DidOpenTextDocumentParams | types.DidChangeTextDocumentParams,
 ) -> None:
     doc = ls.workspace.get_text_document(params.text_document.uri)
+    logger.debug("validate_arxml: %s", params.text_document.uri)
     diagnostics = []
 
     # Pass 1: XML syntax
     error = parse_arxml(doc.source)
     if error and hasattr(error, "lineno") and error.lineno is not None:
+        logger.debug("XML syntax error at line %s: %s", error.lineno, error.msg)
         diagnostics.append(
             Diagnostic(
                 range=Range(
@@ -129,6 +142,7 @@ def validate_arxml(
             )
         )
 
+    logger.debug("publishing %d diagnostic(s) for %s", len(diagnostics), doc.uri)
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=doc.uri, diagnostics=diagnostics)
     )
@@ -188,6 +202,7 @@ def document_symbols(
 def go_to_definition(
     ls: LanguageServer, params: TextDocumentPositionParams
 ) -> Location | None:
+    logger.debug("go_to_definition: %s line %d", params.text_document.uri, params.position.line)
     """Jump to the element under the cursor.
 
     When the cursor is on a path segment within a -REF or -TREF tag, this jumps
@@ -226,6 +241,7 @@ def go_to_definition(
         return None
 
     target_line = target_node.element.sourceline
+    logger.debug("definition found: %s -> %s line %d", target_path, target_uri, target_line)
     return Location(
         uri=target_uri,
         range=Range(
@@ -240,6 +256,7 @@ def find_references(
     ls: LanguageServer, params: types.ReferenceParams
 ) -> list[Location] | None:
     """Find all -REF/-TREF elements across the workspace that point to the SHORT-NAME under cursor."""
+    logger.debug("find_references: %s line %d", params.text_document.uri, params.position.line)
     doc = ls.workspace.get_text_document(params.text_document.uri)
 
     short_name_info = get_short_name_at_position(doc.source, params.position.line)
@@ -293,6 +310,7 @@ def find_references(
             )
         )
 
+    logger.debug("find_references: found %d location(s)", len(locations))
     return locations if locations else None
 
 
